@@ -21,13 +21,10 @@ jobs:
         run: |
           node << 'NODESCRIPT'
           const crypto = require('crypto');
-          const https  = require('https');
           const http   = require('http');
 
-          const ZONE       = parseInt(process.env.ZONE);
-          const SERVER_IP  = process.env.SERVER_IP;
-          const ZONE_SZ    = Math.floor(0xFFFFFFFF / 32);
-          const BATCH      = 500000;
+          const ZONE      = parseInt(process.env.ZONE);
+          const SERVER_IP = process.env.SERVER_IP;
 
           function countBits(buf) {
               let bits = 0;
@@ -39,32 +36,19 @@ jobs:
                   if (b & 0x20) { bits += 2; break; }
                   if (b & 0x10) { bits += 3; break; }
                   if (b & 0x08) { bits += 4; break; }
-                  if (b & 0x04) { bits += 5; break; }
                   if (b & 0x02) { bits += 6; break; }
                   bits += 7; break;
               }
               return bits;
           }
 
-          // Job vom Server holen
-          function getJob() {
+          function get(path) {
               return new Promise((resolve, reject) => {
-                  http.get('http://' + SERVER_IP + ':3001/api/job', res => {
+                  http.get('http://' + SERVER_IP + ':3001' + path, res => {
                       let raw = '';
                       res.on('data', c => raw += c);
                       res.on('end', () => { try { resolve(JSON.parse(raw)); } catch(e) { reject(e); } });
                   }).on('error', reject);
-              });
-          }
-
-          // Koordinator-Ziel lesen
-          function getZiel() {
-              return new Promise((resolve) => {
-                  http.get('http://' + SERVER_IP + ':3001/api/koordinator_ziel', res => {
-                      let raw = '';
-                      res.on('data', c => raw += c);
-                      res.on('end', () => { try { resolve(JSON.parse(raw)); } catch(_) { resolve(null); } });
-                  }).on('error', () => resolve(null));
               });
           }
 
@@ -81,10 +65,13 @@ jobs:
           }
 
           async function run() {
-              const [job, ziel] = await Promise.all([getJob(), getZiel()]);
+              const [job, cursor, ziel] = await Promise.all([
+                  get('/api/job'),
+                  get('/api/cursor/' + ZONE),
+                  get('/api/koordinator_ziel').catch(() => null),
+              ]);
               if (!job || !job.prevhash) { console.log('Kein Job'); return; }
 
-              // Header bauen
               const h = Buffer.alloc(80);
               h.writeUInt32LE(parseInt(job.version, 16), 0);
               Buffer.from(job.prevhash, 'hex').reverse().copy(h, 4);
@@ -93,36 +80,34 @@ jobs:
               h.writeUInt32LE(parseInt(job.ntime, 16), 68);
               h.writeUInt32LE(parseInt(job.nbits, 16), 72);
 
-              // Koordinator-Ziel oder eigene Zone
-              let from, scanZone;
+              let from, scanZone, count;
               if (ziel && ziel.hotspot && ziel.nonce) {
-                  // Hotspot — alle bohren um den heißen Nonce
                   scanZone = ziel.zone;
-                  const spread = Math.floor(BATCH / 20) * ZONE; // jeder Job leicht versetzt
-                  from = Math.max(0, (ziel.nonce - BATCH/2 + spread)) >>> 0;
+                  const spread = Math.floor(500000 / 20) * ZONE;
+                  from  = Math.max(0, (ziel.nonce - 250000 + spread)) >>> 0;
+                  count = 500000;
                   console.log('HOTSPOT Z' + scanZone + ' @ ' + ziel.nonce + ' bits:' + ziel.bits);
               } else {
-                  // Normal — eigene Zone
                   scanZone = ZONE;
-                  const zoneStart = (ZONE * ZONE_SZ) >>> 0;
-                  const offset    = Math.floor(Math.random() * (ZONE_SZ - BATCH));
-                  from = (zoneStart + offset) >>> 0;
+                  from  = cursor.from >>> 0;
+                  count = cursor.count || 500000;
+                  console.log('SEQ Z' + ZONE + ' from:' + from);
               }
 
               let bestBits = 0, bestNonce = -1;
               const survivors = [];
 
-              for (let i = 0; i < BATCH; i++) {
+              for (let i = 0; i < count; i++) {
                   const nonce = (from + i) >>> 0;
-                  h.writeUInt32BE(nonce, 72);
+                  h.writeUInt32BE(nonce, 76);
                   const buf  = crypto.createHash('sha256').update(h).digest();
                   const bits = countBits(buf);
                   if (bits > bestBits) { bestBits = bits; bestNonce = nonce; }
                   if (bits >= 18) survivors.push({ nonce, bits });
               }
 
-              console.log('Z' + scanZone + ': ' + bestBits + 'b @ nonce ' + bestNonce + ' | survivors: ' + survivors.length);
-              await postResult({ zone: scanZone, bestBits, bestNonce, scanned: BATCH, survivors: survivors.slice(0,5) });
+              console.log('Z' + scanZone + ': ' + bestBits + 'b @ ' + bestNonce + ' | survivors:' + survivors.length);
+              await postResult({ zone: scanZone, bestBits, bestNonce, scanned: count, survivors: survivors.slice(0,5) });
           }
 
           run().catch(e => console.error(e));
