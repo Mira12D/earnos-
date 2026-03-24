@@ -1,0 +1,108 @@
+name: EarnOS Nonce Scanner
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        zone: [12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
+      fail-fast: false
+      max-parallel: 20
+
+    steps:
+      - name: Scan Zone ${{ matrix.zone }}
+        run: |
+          node << 'NODESCRIPT'
+          const crypto = require('crypto');
+          const https  = require('https');
+          const http   = require('http');
+
+          const ZONE       = parseInt(process.env.ZONE);
+          const SERVER_IP  = process.env.SERVER_IP;
+          const ZONE_SZ    = Math.floor(0xFFFFFFFF / 32);
+          const BATCH      = 500000;
+
+          function countBits(buf) {
+              let bits = 0;
+              for (let j = 0; j < buf.length; j++) {
+                  const b = buf[j];
+                  if (b === 0)  { bits += 8; continue; }
+                  if (b & 0x80) break;
+                  if (b & 0x40) { bits += 1; break; }
+                  if (b & 0x20) { bits += 2; break; }
+                  if (b & 0x10) { bits += 3; break; }
+                  if (b & 0x08) { bits += 4; break; }
+                  if (b & 0x04) { bits += 5; break; }
+                  if (b & 0x02) { bits += 6; break; }
+                  bits += 7; break;
+              }
+              return bits;
+          }
+
+          // Job vom Server holen
+          function getJob() {
+              return new Promise((resolve, reject) => {
+                  http.get('http://' + SERVER_IP + ':3001/api/job', res => {
+                      let raw = '';
+                      res.on('data', c => raw += c);
+                      res.on('end', () => { try { resolve(JSON.parse(raw)); } catch(e) { reject(e); } });
+                  }).on('error', reject);
+              });
+          }
+
+          function postResult(data) {
+              return new Promise((resolve) => {
+                  const body = JSON.stringify(data);
+                  const req = http.request({
+                      hostname: SERVER_IP, port: 3001, path: '/api/result', method: 'POST',
+                      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+                  }, res => { res.resume(); res.on('end', resolve); });
+                  req.on('error', resolve);
+                  req.write(body); req.end();
+              });
+          }
+
+          async function run() {
+              const job = await getJob();
+              if (!job || !job.prevhash) { console.log('Kein Job'); return; }
+
+              // Header bauen
+              const h = Buffer.alloc(80);
+              h.writeUInt32LE(parseInt(job.version, 16), 0);
+              Buffer.from(job.prevhash, 'hex').reverse().copy(h, 4);
+              const mk = crypto.createHash('sha256').update(Buffer.from(job.coinb1 + job.coinb2, 'hex')).digest();
+              mk.copy(h, 36);
+              h.writeUInt32LE(parseInt(job.ntime, 16), 68);
+              h.writeUInt32LE(parseInt(job.nbits, 16), 72);
+
+              // Zufälliger Startpunkt in der Zone
+              const zoneStart = (ZONE * ZONE_SZ) >>> 0;
+              const offset    = Math.floor(Math.random() * (ZONE_SZ - BATCH));
+              const from      = (zoneStart + offset) >>> 0;
+
+              let bestBits = 0, bestNonce = -1;
+              const survivors = [];
+
+              for (let i = 0; i < BATCH; i++) {
+                  const nonce = (from + i) >>> 0;
+                  h.writeUInt32BE(nonce, 72);
+                  const buf  = crypto.createHash('sha256').update(h).digest();
+                  const bits = countBits(buf);
+                  if (bits > bestBits) { bestBits = bits; bestNonce = nonce; }
+                  if (bits >= 18) survivors.push({ nonce, bits });
+              }
+
+              console.log('Z' + ZONE + ': ' + bestBits + 'b @ nonce ' + bestNonce + ' | survivors: ' + survivors.length);
+              await postResult({ zone: ZONE, bestBits, bestNonce, scanned: BATCH, survivors: survivors.slice(0,5) });
+          }
+
+          run().catch(e => console.error(e));
+          NODESCRIPT
+        env:
+          ZONE: ${{ matrix.zone }}
+          SERVER_IP: ${{ secrets.SERVER_IP }}
