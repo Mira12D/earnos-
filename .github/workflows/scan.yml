@@ -57,6 +57,17 @@ jobs:
               });
           }
 
+          // Koordinator-Ziel lesen
+          function getZiel() {
+              return new Promise((resolve) => {
+                  http.get('http://' + SERVER_IP + ':3001/api/koordinator_ziel', res => {
+                      let raw = '';
+                      res.on('data', c => raw += c);
+                      res.on('end', () => { try { resolve(JSON.parse(raw)); } catch(_) { resolve(null); } });
+                  }).on('error', () => resolve(null));
+              });
+          }
+
           function postResult(data) {
               return new Promise((resolve) => {
                   const body = JSON.stringify(data);
@@ -70,7 +81,7 @@ jobs:
           }
 
           async function run() {
-              const job = await getJob();
+              const [job, ziel] = await Promise.all([getJob(), getZiel()]);
               if (!job || !job.prevhash) { console.log('Kein Job'); return; }
 
               // Header bauen
@@ -82,10 +93,21 @@ jobs:
               h.writeUInt32LE(parseInt(job.ntime, 16), 68);
               h.writeUInt32LE(parseInt(job.nbits, 16), 72);
 
-              // Zufälliger Startpunkt in der Zone
-              const zoneStart = (ZONE * ZONE_SZ) >>> 0;
-              const offset    = Math.floor(Math.random() * (ZONE_SZ - BATCH));
-              const from      = (zoneStart + offset) >>> 0;
+              // Koordinator-Ziel oder eigene Zone
+              let from, scanZone;
+              if (ziel && ziel.hotspot && ziel.nonce) {
+                  // Hotspot — alle bohren um den heißen Nonce
+                  scanZone = ziel.zone;
+                  const spread = Math.floor(BATCH / 20) * ZONE; // jeder Job leicht versetzt
+                  from = Math.max(0, (ziel.nonce - BATCH/2 + spread)) >>> 0;
+                  console.log('HOTSPOT Z' + scanZone + ' @ ' + ziel.nonce + ' bits:' + ziel.bits);
+              } else {
+                  // Normal — eigene Zone
+                  scanZone = ZONE;
+                  const zoneStart = (ZONE * ZONE_SZ) >>> 0;
+                  const offset    = Math.floor(Math.random() * (ZONE_SZ - BATCH));
+                  from = (zoneStart + offset) >>> 0;
+              }
 
               let bestBits = 0, bestNonce = -1;
               const survivors = [];
@@ -99,8 +121,8 @@ jobs:
                   if (bits >= 18) survivors.push({ nonce, bits });
               }
 
-              console.log('Z' + ZONE + ': ' + bestBits + 'b @ nonce ' + bestNonce + ' | survivors: ' + survivors.length);
-              await postResult({ zone: ZONE, bestBits, bestNonce, scanned: BATCH, survivors: survivors.slice(0,5) });
+              console.log('Z' + scanZone + ': ' + bestBits + 'b @ nonce ' + bestNonce + ' | survivors: ' + survivors.length);
+              await postResult({ zone: scanZone, bestBits, bestNonce, scanned: BATCH, survivors: survivors.slice(0,5) });
           }
 
           run().catch(e => console.error(e));
